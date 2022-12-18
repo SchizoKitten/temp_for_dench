@@ -16,7 +16,7 @@ from lib.model import ActorCritic
 from lib.multiprocessing_env import SubprocVecEnv
 
 
-NUM_ENVS            = 6 #num of parallel envs
+NUM_ENVS            = 8 #num of parallel envs
 ENV_ID              = "Humanoid-v4"
 HIDDEN_SIZE         = 64
 LEARNING_RATE       = 1e-3
@@ -38,7 +38,7 @@ So if one buffer has 2048 transitions and mini-batch-size is 64, then one epoch 
 PPO_EPOCHS          = 10 # how many times we propagate the network over the entire buffer of training data
 TEST_EPOCHS         = 10 # how often we run tests to eval our network, one epoch is one entire ppo update cycle
 NUM_TESTS           = 10 # num of tests we run to average the total rewards, each time we want eval the performance of the network
-TARGET_REWARD       = 500
+TARGET_REWARD       = 10000
 
 
 def make_env():
@@ -56,16 +56,17 @@ def test_env(env, model, device, deterministic=True):
 
     functions runs for one episode and returns total reward
     '''
-    state = env.reset()[0]
+    state, _ = env.reset()
     done = False
+    trunk = False
     total_reward = 0
-    while not done:
+    while not (done or trunk):
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
         dist, _ = model(state)
         #continous action space instead of sampling based on the mean and stdf, we use means
         action = dist.mean.detach().cpu().numpy()[0] if deterministic \
             else dist.sample().cpu().numpy()[0]
-        next_state, reward, done, _, _ = env.step(action)
+        next_state, reward, done, trunk, _ = env.step(action)
         state = next_state
         total_reward += reward
     return total_reward
@@ -162,15 +163,14 @@ if __name__ == "__main__":
     mkdir('.', 'checkpoints')
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--name", default=ENV_ID, help="Name of the run")
+    parser.add_argument("-m", "--model", default=False, help="Model file to load")
     args = parser.parse_args()
     writer = SummaryWriter(comment="ppo_" + args.name)
 
-    # Autodetect CUDA
-    use_cuda = torch.cuda.is_available()
-    device   = torch.device("cuda" if use_cuda else "cpu")
+    device   = torch.device("cpu")
     print('Device:', device)
 
-    # Prepare parallel nvironments
+    # Prepare parallel environments
     envs = [make_env() for i in range(NUM_ENVS)]
     envs = SubprocVecEnv(envs)
     env = gym.make(ENV_ID)
@@ -178,6 +178,8 @@ if __name__ == "__main__":
     num_outputs = envs.action_space.shape[0]
 
     model = ActorCritic(num_inputs, num_outputs, HIDDEN_SIZE).to(device)
+    if args.model:
+        model = torch.load(args.model)
     print(model)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     print("parameters:",model.parameters())
@@ -185,6 +187,8 @@ if __name__ == "__main__":
     frame_idx  = 0
     train_epoch = 0 #one complte update cycle
     best_reward = None
+    
+    nunsaved_runs = 0
 
     state = envs.reset() # 8 actions, 8 next states, 8 rewards, and 8 dones
     early_stop = False
@@ -199,7 +203,7 @@ if __name__ == "__main__":
         masks     = []
 
         for _ in range(PPO_STEPS): #each ppo steps generates actions, states, rewards
-
+        	
             state = torch.FloatTensor(state).to(device)
             dist, value = model(state)
 
@@ -253,5 +257,13 @@ if __name__ == "__main__":
                     fname = os.path.join('.', 'checkpoints', name)
                     print(fname)
                     torch.save(model, fname)
+                    nunsaved_runs = 0
                 best_reward = test_reward
+            elif nunsaved_runs == 15:
+                name = "%s_save_%+.3f_%d.dat" % (args.name, test_reward, frame_idx)
+                fname = os.path.join('.', 'checkpoints', name)
+                print(fname)
+                torch.save(model, fname)
+                nunsaved_runs = 0
+            else: nunsaved_runs += 1
             if test_reward > TARGET_REWARD: early_stop = True
